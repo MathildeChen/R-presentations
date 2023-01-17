@@ -1,0 +1,532 @@
+---
+title: "Data Club - Application d'un analyse de type Machine Learning en épidémiologie"
+author: "Mathilde CHEN, Inserm, UMR 1153 CRESS, EpiAgeing"
+date: "2023-01-17"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: united
+    highlight: tango
+---
+
+Ce document décrit la procédure pour utiliser le package **plsRcox** (Bertrand et al., 2014, https://fbertran.github.io/plsRcox/) pour la régression de sparse Partial Least Square pour l'analyse de survie (sPLSCox). Cette méthode est une alternative aux analyses de survie classique en cas d'un nombre important de variables explicatives/prédicteurs très corrélés.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# -----------
+# Packages & functions
+library(tidyverse)
+library(plsRcox)
+library(corrplot)
+library(arsenal)
+library(kableExtra)
+library(caret)
+library(survival)
+library(survcomp)
+library(survAUC)
+library(resample)
+library(parallel)
+library(doParallel)
+library(foreach)
+
+```
+
+## Exploration rapide des données 
+
+Pour illustrer cet atelier, nous allons utiliser une partie d'un jeu de données accessible en ligne via le site Kaggle (https://www.kaggle.com/datasets/mitishaagarwal/patient), que j'ai légèrement modifié pour qu'il puisse être utilisable dans notre exemple. Le code utilisé pour la construction du jeu de données se trouve dans le script RMarkdown fourni. 
+
+
+```{r construction du jeu de données, eval=F}
+
+# Données 
+# Exemple de jeu de données 
+# Téléchargeable via : https://www.kaggle.com/datasets/mitishaagarwal/patient 
+data_init <- read.csv(file = "E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/Code/dataset.patient.survival.csv") %>% 
+  select(-X) %>% 
+  drop_na() %>% # retirer toutes les données manquantes
+  mutate(ethnicity_2 = if_else(ethnicity == "Caucasian", 0, 1)) %>% # Ethnicité majoritaire = Caucasienne (codé comme ref) 
+  mutate(sex = if_else(gender == "M", 0, 1))                        # Catégorie majoritaire = Homme (codé comme ref) 
+
+dim(data_init) # 57598 patients 
+
+# Sélection d'un 1/10 du jeu de données 
+set.seed(1)
+data_id <- createFolds(data_init$hospital_death, k=20) 
+
+data <- data_init[data_id$Fold01,]
+dim(data) # 2880
+
+# Générer les durées de survie
+set.seed(123)
+data$hospital_time <- rnorm(nrow(data), mean = 8.13, sd = 2)
+# Vérifier qu'il n'y a pas de temps < 0 année
+hist(data$hospital_time) 
+
+# Multimorbidity index
+data <- data %>% 
+  group_by(patient_id) %>% 
+  mutate(multimorbidity = sum(aids, cirrhosis, diabetes_mellitus, hepatic_failure, immunosuppression, 
+                              leukemia, lymphoma, solid_tumor_with_metastasis)) %>% ungroup()
+
+table(data$multimorbidity, exclude=NULL)
+#    0    1    2    3 
+# 2078  720   67   15 
+
+# Select variables 
+data <- data %>% 
+  select(patient_id, hospital_time, hospital_death, 
+         age, sex, ethnicity_2, bmi, multimorbidity, 
+         d1_diasbp_max, d1_diasbp_min, 
+         d1_heartrate_max, d1_heartrate_min, 
+         d1_mbp_max, d1_mbp_min, 
+         d1_resprate_max, d1_resprate_min, 
+         d1_spo2_max, d1_spo2_min, 
+         d1_sysbp_max, d1_sysbp_min, 
+         d1_temp_max, d1_temp_min, 
+         h1_diasbp_max, h1_diasbp_min, 
+         h1_heartrate_max, h1_heartrate_min, 
+         h1_mbp_max, h1_mbp_min, 
+         h1_resprate_max, h1_resprate_min, 
+         h1_spo2_max, h1_spo2_min, 
+         h1_sysbp_max, h1_sysbp_min, 
+         d1_glucose_max, d1_glucose_min, 
+         d1_potassium_max, d1_potassium_min)
+
+write.csv(data, "E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/Code/dataset.patient.survival_2.csv")
+
+```
+
+
+```{r chargement des donnees, echo=F}
+data <- read.csv("E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/Code/dataset.patient.survival_2.csv")
+
+# Tableau descriptif des données en fonction du statut vital
+options(digits = 2)
+summary(tableby(hospital_death ~ ., 
+                data=data %>% select(-X, -patient_id),
+                # Option for output table
+                control=tableby.control(total=TRUE,
+                                        digits=3, digits.p = 3,
+                                        numeric.simplify = TRUE,
+                                        cat.simplify = TRUE,
+                                        numeric.stats = c("Nmiss", "meansd"))),
+        text= T, 
+        labelTranslations = list(hospital_time="Durée de suivi (années)", 
+         age="Age (années)", sex="Femmes", ethnicity_2="Ethnicité non caucasienne", bmi="Indice de masse corporelle (kg/m²)", multimorbidity="Nombre de maladies chroniques"),
+        title = "Tableau descriptif de la population de patients en fonction du statut vital") %>% 
+  kbl() %>% 
+  kable_styling()
+
+```
+
+Parmi les variables disponibles, on voit que la valeur maximale et minimale de nombreux biomarqueurs sont disponibles (variables dont le nom commence par "d1"). Certains sont particulièrement corrélés entre eux.
+
+```{r correlation, echo=FALSE, width=16}
+
+# > Corrélation entre les prédicteurs 
+data %>% 
+  select(d1_diasbp_max, d1_diasbp_min, 
+         d1_heartrate_max, d1_heartrate_min, 
+         d1_mbp_max, d1_mbp_min, 
+         d1_resprate_max, d1_resprate_min, 
+         d1_spo2_max, d1_spo2_min, 
+         d1_sysbp_max, d1_sysbp_min, 
+         d1_temp_max, d1_temp_min, 
+         h1_diasbp_max, h1_diasbp_min, 
+         h1_heartrate_max, h1_heartrate_min, 
+         h1_mbp_max, h1_mbp_min, 
+         h1_resprate_max, h1_resprate_min, 
+         h1_spo2_max, h1_spo2_min, 
+         h1_sysbp_max, h1_sysbp_min, 
+         d1_glucose_max, d1_glucose_min, 
+         d1_potassium_max, d1_potassium_min) %>% 
+  cor(.) %>% 
+  corrplot(corr = ., method = "square", type = "lower", diag = F,
+         number.cex = 0.3, tl.cex = 0.3, order = "hclust")
+
+```
+
+
+## Procédure de validation croisée
+
+Avant d'ajuster le modèle sPLSCox, il faut choisir la valeur optimale de deux hyper-paramètres: (1) **ncomp**: le nombre de composantes latentes calculées par le modèle et (2) **eta** : le seuil de sparsité, c'est-à-dire la pression de sélection des variables. Plus le seuil de sélection est élevé, plus les variables sélectionnées par l'algorithme sont associées à la sruvie des patients. 
+
+
+La sélection des valeur de ces deux paramètres est cruciale car elles vont déterminer le nombre de variables sélectionnées ainsi que le nombre de composantes latentes issues de la sPLSCox. Afin de prévenir le risque d'overfitting, il est nécessaire de définir ces valeurs par validation croisée. 
+
+### Déclaration des variables et partition des données
+```{r cv}
+
+# > Prédicteurs (Biomarqueurs disponibles dans le jeu de données)
+Xplan <- data %>% 
+  select(d1_diasbp_max, d1_diasbp_min, 
+         d1_heartrate_max, d1_heartrate_min, 
+         d1_mbp_max, d1_mbp_min, 
+         d1_resprate_max, d1_resprate_min, 
+         d1_spo2_max, d1_spo2_min, 
+         d1_sysbp_max, d1_sysbp_min, 
+         d1_temp_max, d1_temp_min, 
+         h1_diasbp_max, h1_diasbp_min, 
+         h1_heartrate_max, h1_heartrate_min, 
+         h1_mbp_max, h1_mbp_min, 
+         h1_resprate_max, h1_resprate_min, 
+         h1_spo2_max, h1_spo2_min, 
+         h1_sysbp_max, h1_sysbp_min, 
+         d1_glucose_max, d1_glucose_min, 
+         d1_potassium_max, d1_potassium_min) # 30 prédicteurs 
+
+# > Survie
+Cas <- data$hospital_death # 255 décès
+T <- data$hospital_time    # Suivi moyen (écart-type) : 8.2 (2) années
+
+# > Partition des données en 5 groupes 
+set.seed(456)
+folds <- createFolds(y = Cas, k = 5)
+
+```
+
+### Validation croisée avec plsRcox
+
+Le package plsRCox contient la fonction **cv.coxsplsDR()**, dont le but est de "cross-valider" les modèles ajustés par la function **coxsplsDR()**.
+La fonction va évaluer la performance de l'algorithme pour une valeur de eta donnée (par défaut eta=0.5) et pour un nombre de composantes latentes variant de 0 à l'argument **nt** (par défaut 10). Ici, on définit nt = 5. 
+
+```{r cv.coxsplsDR, eval=FALSE, message=F}
+
+# > Afin de réduire le temps de calcul, on peut paralléliser l'opération
+# >>> start cluster
+N_core_in_computer <- detectCores()-1
+Create_socket <- makePSOCKcluster(N_core_in_computer)
+Register_your_parameters <- registerDoParallel(Create_socket)
+
+
+# Utilisation de cv.coxsplsDR 
+cv_test <- cv.coxsplsDR(list(x = Xplan, time = T, status = Cas),  
+                    nt = 5,             # varie de 0 à ncomp (ici 5)
+                    eta = 0.5,          # seuil de sparsité
+                    givefold = folds,   # il est possible de fournir la partition des données; si non, la fonction partitionne elle-même les données
+                    scaleX = TRUE,      # standardiser X (TRUE: oui, FALSE : non)
+                    scaleY = FALSE,     # standardiser Y (TRUE: oui, FALSE : non)
+                    plot.it = TRUE)     # représentation graphique des résultats
+
+
+# >>> stop cluster//
+stopCluster(Create_socket)
+
+save(cv_test, file = "E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/R.objects/cv_test.rda")
+
+```
+
+![](E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/Figures_presentation/cv1.png)
+
+Le graphique représente la performance de l'algorithme pour chaque valeur de ncomp (pour une même valeur de eta, i.e. eta = 0.5). Le critère d'évaluation utilisé ici est iAUC, mais la fonction peut calculer en tout 13 critères d'évaluations différents, dont la liste est dans l'aide R de la fonction (taper **?cv.coxsplsDR** dans la console). Pour calculer tous les critères, il faut ajouter **allCVcrit=TRUE** dans les arguments de la fonction. Ce graphique montre que Pour une valeur de eta = 0.5, la valeur optimale de composantes latentes (ncomp) obtenue par la fonction est ncomp = 4 et le nombre de variables retenues dans le modèle est de 26. Le problème c'est que cette fonction ne va tester qu'une seule valeur de eta à la fois. Dans notre cas, on souhaite choisir la valeur de ncomp et la valeur de eta. 
+
+```{r, echo=F}
+load("E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/R.objects/cv_test.rda")
+```
+
+La sortie de cette fonction contient différentes informations : 
+
+```{r}
+
+# > la valeur de ncomp
+cv_test$nt
+
+# > les valeurs moyenne d'iAUC par chaque valeur de ncomp
+cv_test$cv.error10
+  
+# > les écarts type associés
+cv_test$cv.se10
+  
+# > la valeur optimale de ncomp
+cv_test$lambda.min10
+
+# > le nombre de variables sélectionnées
+cv_test$nzb
+
+```
+
+
+
+### Validation croisée avec une fonction "maison"
+
+Afin de pouvoir tester toutes les combinaisons des valeurs de eta et de ncomp, je propose ici une fonction développée à partir de la fonction **cv.coxsplsDR()** et qui va automatiser le processus pour une grille de plusieurs valeurs de eta.
+
+```{r Function for cross-validation}
+
+
+# Function for cross-validation:
+# Arguments should be: 
+# - x = Xplan, predictors
+# - time = T, survival time
+# - status = Cas, vital status at the end of the follow up
+# - eta = une grille de valeurs à tester pour le paramètre eta
+# - ncomp = la valeur maximale de composantes à tester
+# - scale.x = TRUE/FALSE, indique si la fonction doit elle même standardiser les prédicteurs
+
+cv_eta_ncomp <- function(x, time, status, eta, ncomp, folds, scale.x){
+  
+  # >>> 5-folds cross-validation
+  cv_e = cv.coxsplsDR(list(x = x, time = time, status = status), # arguments décrivant les prédicteurs, le temps de suivi et le statut vital
+                      nt = ncomp,                                # varies from 0 to ncomp 
+                      eta = eta,                                 # varies according to eta grid provided
+                      givefold = folds,                          # provide folds to have consistent partition during the cross-validation 
+                      scaleX = scale.x,                          # TRUE = scale Xplan ; FALSE = do not scale Xplan (if already scaled)
+                      scaleY = FALSE,                            # do not scale Y
+                      plot.it = FALSE)                           # do not plot the results of the cv.coxsplsDR() function
+  
+  # >>> format results into a table
+  perf_e <- data.frame(eta        = eta,             # value of eta
+                       n_nt       = 0:cv_e$nt,       # value of ncomp
+                       cv.error10 = cv_e$cv.error10, # predictive mean value (iAUC criterion) of the eta*ncomp combinaison over the 5 folds
+                       cv.se10    = cv_e$cv.se10)    # corresponding standard error
+  
+  # >>> return the CV object and the table with results for each combination of ncomp and eta
+  return(list("cv_object" = cv_e,
+              "perf_e" = perf_e))
+  
+  
+}
+
+```
+
+Dans un premier temps, on va effectuer une validation croisée sur une grille de eta variant de 0 (peu de sélection) à 0.95 (forte sélection)
+
+```{r cv 2, eval=F, warning=F}
+
+# > Grille de la valeur eta
+grille_eta <- seq(0.05, 0.95, by=0.05)
+grille_eta
+
+# > Afin de réduire le temps de calcul, on peut paralléliser l'opération
+# >>> start cluster
+N_core_in_computer <- detectCores()-1
+Create_socket <- makePSOCKcluster(N_core_in_computer)
+Register_your_parameters <- registerDoParallel(Create_socket)
+
+
+# > Application de la fonction "maison" sur la grille de eta prédéfinie
+cv_auto <- lapply(grille_eta,                         # pour chaque valeur de eta 
+                  cv_eta_ncomp,                       # appliquer la fonction cv_eta_ncomp définie précédemment
+                  ncomp = 5,                          # en faisant varier ncomp de 0 à 5
+                  folds = folds,                      # afin de garder la même partition des données durant toute la procédure
+                  x = Xplan, time = T, status = Cas)  # mêmes arguments que précédemment pour les prédicteurs, le temps de suivi et le statut vital
+
+
+# >>> stop cluster//
+stopCluster(Create_socket)
+
+save(cv_auto, file = "E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/R.objects/cv_auto.rda")
+```
+
+### Extraction des résultats de la validation croisée
+
+Extraction des résultats, c'est-à-dire pour chaque paire de eta*ncomp : (1) un tableau avec la performance moyenne de l'algorithme calculée sur les 5 parties du jeu de données (cv.error10) et (2) le nombre de prédicteurs sélectionnés
+
+```{r, echo=F}
+load("E:/PC_FIXE/Conferences/2023_01_17_Club Data Stats/R.objects/cv_auto.rda")
+```
+
+```{r results extraction}
+
+# > Extraction des résultats (sous forme de liste)
+tab_perf_cv <- map_dfr(cv_auto, ~ { data.frame(.x$perf_e, 
+                                               n_select = .x$cv_object$nzb) })
+```
+
+On affiche ici la meilleure combinaison de eta * ncomp en se basant sur le critère iAUC (ce critère a été choisi par les auteurs du package qui l'ont classé comme le plus fiable pour ce type de modèle ; il existe en tout 13 critères calculés par la fonction cv.coxsplsDR).
+
+```{r best eta ncomp combination}
+
+options(digits = 10)
+tab_perf_cv %>% 
+  arrange(desc(cv.error10)) %>% 
+  head() %>% 
+  kbl() %>% 
+  kable_styling()
+
+```
+
+On peut aussi représentation graphiquement les résultats de la validation croisée : 
+
+```{r cv graphs}
+
+# 1. Performance de l'algorithme 
+tab_perf_cv %>% 
+  filter(n_nt > 0, eta > 0.5) %>% 
+  ggplot(., aes(x = n_nt, y = cv.error10, color = as.factor(eta))) + 
+  geom_line() + 
+  geom_point() + 
+  geom_errorbar(aes(ymin = cv.error10-cv.se10, ymax = cv.error10+cv.se10), width=0.01) + 
+  theme_bw() + 
+  labs(x = "Nombre de composantes", y = "iAUC")
+
+
+```
+
+
+```{r cv graphs 2}
+
+# 2. Nombre de variables sélectionnées 
+tab_perf_cv %>% 
+  filter(n_nt > 0, eta > 0.5) %>%
+  ggplot(., aes(x = n_nt, y = n_select, color = as.factor(eta))) + 
+  geom_line() + 
+  geom_point() + 
+  theme_bw() + 
+  labs(x = "Nombre de composantes", y = "Nombre de prédicteurs sélectionnés")
+
+
+```
+Plus le niveau de sparsité est faible, plus on inclu de variables. Plus on augmente le nombre de composantes, plus on augmente le nombre de variables. 
+
+Si nécessaire, on peut refaire une nouvelle procédure de validation croisée sur une grille restreinte et plus fine de eta.
+
+Par ailleurs, on peut aussi vouloir connaître quelles sont les variables qui sont exclues le plus rapidement possible  : 
+
+
+
+##  Calcul des composantes latentes en utilisant les hyper-paramètres sélectionnés par la procédure de validation croisée
+
+```{r}
+
+# > Ajustement du modèle sPLS
+sPLS_fit  = coxsplsDR(Xplan, T, Cas,
+                      ncomp = 4,
+                      eta = 0.75, 
+                      allres = TRUE, 
+                      scaleX = TRUE,
+                      scaleY = FALSE)
+
+```
+
+
+```{r}
+# > Extraction des composantes latentes estimées par le modèle
+components_sPLS <- sPLS_fit$tt_splsDR
+
+# > Incorporation des composantes dans le jeu de données initial 
+new_data <- cbind(data, components_sPLS)
+
+```
+
+On peut déjà s'intéresser à l'association de ces composantes avec la mortalité : 
+
+```{r, echo=FALSE}
+options(digits = 2)
+summary(tableby(hospital_death ~ dim.1 + dim.2 + dim.3 + dim.4, 
+                data=new_data,
+                # Option for output table
+                control=tableby.control(total=TRUE,
+                                        digits=3, digits.p = 3,
+                                        numeric.simplify = TRUE,
+                                        cat.simplify = TRUE,
+                                        numeric.stats = c("Nmiss", "meansd"))),
+        #text= T, 
+        labelTranslations = list(dim.1="Composante 1", dim.2="Composante 2", dim.3="Composante 3", dim.4="Composante 4"),
+        title = "Association des composantes avec le statut vital") %>% 
+  kbl() %>% 
+  kable_styling()
+```
+
+
+
+
+
+```{r}
+# > Extraction des poids attribués à chaque variable lors de la 
+#   construction des variables latentes 
+loadings_sPLS <- data.frame(varname = rownames(sPLS_fit$splsDR_modplsr$loadings$X),
+                            sPLS_fit$splsDR_modplsr$loadings$X, row.names = NULL)
+
+loadings_sPLS %>% 
+  kbl() %>% 
+  kable_styling()
+
+```
+
+Représentation graphique du poids des variables : 
+
+```{r}
+
+loadings_sPLS %>% 
+  pivot_longer(cols = c("comp.1","comp.2", "comp.3", "comp.4"), 
+               names_to = "composante") %>% 
+ggplot(data = , aes(x=value, y=varname)) + 
+  geom_col(fill = "grey30") + 
+  facet_grid(.~composante) + 
+  labs(x = "Loadings", y = "Variables sélectionnées") +
+  theme_bw() + 
+  ggtitle("Poids des variables sélectionnées dans les composantes latentes") + 
+  scale_x_continuous(breaks = c(-0.5, 0, 0.5), labels = c(-0.5, 0, 0.5))
+
+```
+
+## Utilisation des composantes dans une analyse de survie
+
+```{r, echo=FALSE}
+
+# Function to extract coefficients, HR and p.values from coxph() models
+mod.out <- function(mod){
+  x <- summary(mod)
+  
+  mod.output <- 
+    # extract data from models outputs
+    data.frame(
+      var = row.names(x$coefficients),                         # variable name
+      beta = signif(x$coefficients[,1], digits=5),             # coefficient beta
+      HR = signif(x$coefficients[,2], digits=5),               # HR, exp(beta)
+      HR.confint.lower = signif(x$conf.int[,"lower .95"], 5),  # HR 95% CI lower bound
+      HR.confint.upper = signif(x$conf.int[,"upper .95"],5),   # HR 95% CI upper bound 
+      p.value = x$coefficients[,"Pr(>|z|)"]) %>% 
+    # labs for HR and p.value
+    mutate(HR.lab = paste0(format(round(HR, 2), nsmall = 2), " (", format(round(HR.confint.lower, 2), nsmall = 2), ", ", format(round(HR.confint.upper, 2), nsmall = 2), ")"),
+           #mutate(HR.lab = paste0(format(signif(HR, 2), nsmall = 2), " (", format(signif(HR.confint.lower, 2), nsmall = 2), ", ", format(signif(HR.confint.upper, 2), nsmall = 2), ")"),
+           p.value.lab = if_else(p.value < 0.001, "<.001", as.character(signif(p.value, digits=2)))) 
+  
+  return(mod.output)
+}  
+  
+```
+
+Ajustement du modèle sans les composantes :
+ 
+```{r}
+ 
+M1 <- coxph(Surv(hospital_time, hospital_death) ~
+                   age + bmi + ethnicity_2 + sex, # facteurs de confusion
+                 data = new_data) 
+
+
+```
+
+```{r, echo=FALSE}
+mod.out(mod = M1) %>% 
+  select(HR.lab, p.value.lab) %>% 
+  kbl() %>% 
+  kable_styling()
+```
+
+Ajustementr du modèle avec composantes : 
+
+```{r}
+M1_dim <- coxph(Surv(hospital_time, hospital_death) ~ dim.1 + dim.2 + dim.3 + dim.4 +   # Composantes dérivées de la régression sPLS 
+                   age + bmi + ethnicity_2 + sex, # facteurs de confusion
+                 data = new_data) 
+```
+
+```{r, echo=F}
+
+mod.out(mod = M1_dim) %>% 
+  select(HR.lab, p.value.lab) %>% 
+  kbl() %>% 
+  kable_styling()
+
+```
+
+
+Les composantes 1, 2, et 4 sont associées à la mortalité, mais pas la 3ème. 
+
